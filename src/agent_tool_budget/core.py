@@ -1,253 +1,140 @@
-"""Per-tool call count caps for agent runs.
+"""Per-tool call-count budget enforcement for agent loops.
 
-:class:`ToolBudget` lets you set a maximum number of calls per tool and
-tracks consumption.  When a tool is consumed beyond its cap the default
-behaviour is to raise :class:`ToolBudgetExceeded`.  You can install a
-callback instead if you want soft-limit behaviour.
+Limits how many times each tool can be called in a session.
+Different from rate limiting (time-based) — this is a total call count cap.
 
-Example::
-
-    from agent_tool_budget import ToolBudget, ToolBudgetExceeded
-
-    budget = ToolBudget()
-    budget.set("search", max_calls=3)
-    budget.set("write_file", max_calls=1)
-
-    budget.consume("search")   # 1 / 3
-    budget.consume("search")   # 2 / 3
-    budget.consume("search")   # 3 / 3  (at limit, not yet exceeded)
-
-    try:
-        budget.consume("search")   # raises ToolBudgetExceeded
-    except ToolBudgetExceeded as e:
-        print(e.tool_name, e.max_calls, e.used)
-
-    print(budget.remaining("search"))      # 0
-    print(budget.is_exhausted("search"))   # True
-    print(budget.summary())
+Zero dependencies — standard library only.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
-class ToolBudgetExceeded(Exception):
-    """Raised when a tool call exceeds its configured budget.
-
-    Attributes:
-        tool_name: Name of the tool that was over-consumed.
-        max_calls: The configured cap.
-        used:      Number of times the tool has been consumed (including the
-                   call that triggered this exception).
-    """
-
-    def __init__(self, tool_name: str, max_calls: int, used: int) -> None:
+class BudgetExhausted(Exception):
+    def __init__(self, tool_name: str, limit: int, used: int) -> None:
         self.tool_name = tool_name
-        self.max_calls = max_calls
+        self.limit = limit
         self.used = used
-        super().__init__(
-            f"Tool '{tool_name}' exceeded its budget of {max_calls} calls "
-            f"(attempted call #{used})"
-        )
+        super().__init__(f"budget exhausted for '{tool_name}': used {used}/{limit} calls")
 
 
 @dataclass
-class ToolBudgetEntry:
-    """Budget configuration and usage for a single tool.
-
-    Attributes:
-        tool_name: Name of the tool.
-        max_calls: Maximum allowed calls (``None`` = unlimited).
-        used:      Number of calls consumed so far.
-    """
-
+class ToolUsage:
     tool_name: str
-    max_calls: int | None = None
-    used: int = 0
-    _on_exceed: Callable[[str, int, int], None] | None = field(
-        default=None, repr=False
-    )
+    limit: "int | None"
+    used: int
 
     @property
-    def remaining(self) -> int | None:
-        """Calls remaining, or ``None`` if unlimited."""
-        if self.max_calls is None:
+    def remaining(self) -> "int | None":
+        if self.limit is None:
             return None
-        return max(0, self.max_calls - self.used)
+        return max(0, self.limit - self.used)
 
     @property
-    def is_exhausted(self) -> bool:
-        """``True`` if the tool has been consumed up to or past its cap."""
-        if self.max_calls is None:
+    def exhausted(self) -> bool:
+        if self.limit is None:
             return False
-        return self.used >= self.max_calls
+        return self.used >= self.limit
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool_name": self.tool_name,
-            "max_calls": self.max_calls,
-            "used": self.used,
-            "remaining": self.remaining,
-            "is_exhausted": self.is_exhausted,
-        }
+    @property
+    def ok(self) -> bool:
+        return not self.exhausted
+
+    @property
+    def pct_used(self) -> float:
+        if self.limit is None or self.limit == 0:
+            return 0.0
+        return min(1.0, self.used / self.limit)
 
 
 class ToolBudget:
-    """Per-tool call count budget for an agent run.
+    _WILDCARD = "*"
 
-    Example::
+    def __init__(self, limits=None, *, default_limit=None, raise_on_exhausted=True):
+        self._limits: dict = {}
+        self._used: dict = {}
+        self.raise_on_exhausted = raise_on_exhausted
 
-        budget = ToolBudget(default_max=10)   # all tools capped at 10
-        budget.set("search", max_calls=3)     # override for search
+        if limits:
+            for k, v in limits.items():
+                if v < 0:
+                    raise ValueError(f"limit for '{k}' must be >= 0")
+                self._limits[k] = v
 
-        budget.consume("search")  # ok
-        budget.used("search")     # 1
-    """
-
-    def __init__(
-        self,
-        *,
-        default_max: int | None = None,
-        on_exceed: Callable[[str, int, int], None] | None = None,
-    ) -> None:
-        """
-        Args:
-            default_max: Cap applied to all tools that don't have an explicit
-                         ``set()`` call.  ``None`` means unlimited by default.
-            on_exceed:   Optional callback ``(tool_name, max_calls, used)``
-                         called instead of raising when a tool is over-consumed.
-                         If provided, ``consume()`` does NOT raise.
-        """
-        self._default_max = default_max
-        self._on_exceed = on_exceed
-        self._entries: dict[str, ToolBudgetEntry] = {}
-
-    # ------------------------------------------------------------------
-    # Configuration
-    # ------------------------------------------------------------------
-
-    def set(
-        self,
-        tool_name: str,
-        *,
-        max_calls: int | None,
-        on_exceed: Callable[[str, int, int], None] | None = None,
-    ) -> None:
-        """Configure the budget for *tool_name*.
-
-        Args:
-            tool_name: Tool to configure.
-            max_calls: Maximum allowed calls (``None`` = unlimited for this
-                       tool, regardless of *default_max*).
-            on_exceed: Per-tool callback, overrides the global one.
-        """
-        if tool_name in self._entries:
-            entry = self._entries[tool_name]
-            entry.max_calls = max_calls
-            entry._on_exceed = on_exceed
+        if default_limit is not None:
+            if default_limit < 0:
+                raise ValueError("default_limit must be >= 0")
+            self._default = default_limit
+        elif self._WILDCARD in self._limits:
+            self._default = self._limits.pop(self._WILDCARD)
         else:
-            self._entries[tool_name] = ToolBudgetEntry(
-                tool_name=tool_name,
-                max_calls=max_calls,
-                _on_exceed=on_exceed,
-            )
+            self._default = None
 
-    def _get_or_create(self, tool_name: str) -> ToolBudgetEntry:
-        if tool_name not in self._entries:
-            self._entries[tool_name] = ToolBudgetEntry(
-                tool_name=tool_name,
-                max_calls=self._default_max,
-            )
-        return self._entries[tool_name]
+    def _get_limit(self, tool_name):
+        if tool_name in self._limits:
+            return self._limits[tool_name]
+        return self._default
 
-    # ------------------------------------------------------------------
-    # Consumption
-    # ------------------------------------------------------------------
+    def use(self, tool_name, n=1):
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        limit = self._get_limit(tool_name)
+        current = self._used.get(tool_name, 0)
+        new_count = current + n
+        if limit is not None and new_count > limit:
+            self._used[tool_name] = new_count
+            if self.raise_on_exhausted:
+                raise BudgetExhausted(tool_name, limit, new_count)
+            return False
+        self._used[tool_name] = new_count
+        return True
 
-    def consume(self, tool_name: str) -> None:
-        """Record one call to *tool_name*.
-
-        Raises:
-            ToolBudgetExceeded: when the cap is exceeded and no ``on_exceed``
-                                callback is configured.
-        """
-        entry = self._get_or_create(tool_name)
-        entry.used += 1
-        cap = entry.max_calls
-        if cap is not None and entry.used > cap:
-            # Determine which callback fires
-            cb = entry._on_exceed if entry._on_exceed is not None else self._on_exceed
-            if cb is not None:
-                cb(tool_name, cap, entry.used)
-            else:
-                raise ToolBudgetExceeded(tool_name, cap, entry.used)
-
-    def check(self, tool_name: str) -> bool:
-        """Return ``True`` if consuming *tool_name* one more time is within budget.
-
-        Does NOT increment the counter.
-        """
-        entry = self._get_or_create(tool_name)
-        if entry.max_calls is None:
+    def check(self, tool_name):
+        limit = self._get_limit(tool_name)
+        if limit is None:
             return True
-        return entry.used < entry.max_calls
+        return self._used.get(tool_name, 0) < limit
 
-    # ------------------------------------------------------------------
-    # Inspection
-    # ------------------------------------------------------------------
+    def remaining(self, tool_name):
+        limit = self._get_limit(tool_name)
+        if limit is None:
+            return None
+        return max(0, limit - self._used.get(tool_name, 0))
 
-    def used(self, tool_name: str) -> int:
-        """Number of times *tool_name* has been consumed."""
-        return self._get_or_create(tool_name).used
+    def used(self, tool_name):
+        return self._used.get(tool_name, 0)
 
-    def remaining(self, tool_name: str) -> int | None:
-        """Remaining calls for *tool_name*, or ``None`` if unlimited."""
-        return self._get_or_create(tool_name).remaining
+    def exhausted(self, tool_name):
+        limit = self._get_limit(tool_name)
+        if limit is None:
+            return False
+        return self._used.get(tool_name, 0) >= limit
 
-    def is_exhausted(self, tool_name: str) -> bool:
-        """``True`` if *tool_name* has hit its cap."""
-        return self._get_or_create(tool_name).is_exhausted
+    def ok(self, tool_name):
+        return not self.exhausted(tool_name)
 
-    def entry(self, tool_name: str) -> ToolBudgetEntry:
-        """Return the :class:`ToolBudgetEntry` for *tool_name*."""
-        return self._get_or_create(tool_name)
+    def usage(self, tool_name):
+        return ToolUsage(tool_name=tool_name, limit=self._get_limit(tool_name), used=self._used.get(tool_name, 0))
 
-    def all_tools(self) -> list[str]:
-        """Sorted list of all tool names that have been configured or consumed."""
-        return sorted(self._entries)
+    def summary(self):
+        result = {}
+        for name in self._used:
+            u = self.usage(name)
+            result[name] = {"used": u.used, "limit": u.limit, "remaining": u.remaining, "exhausted": u.exhausted}
+        return result
 
-    # ------------------------------------------------------------------
-    # Reset
-    # ------------------------------------------------------------------
+    def reset(self, tool_name=None):
+        if tool_name is None:
+            self._used.clear()
+        else:
+            self._used.pop(tool_name, None)
+        return self
 
-    def reset(self) -> None:
-        """Reset all counters (keeps configuration)."""
-        for entry in self._entries.values():
-            entry.used = 0
+    def __repr__(self):
+        return f"ToolBudget(limits={self._limits}, default={self._default})"
 
-    def reset_tool(self, tool_name: str) -> None:
-        """Reset the counter for *tool_name* only."""
-        if tool_name in self._entries:
-            self._entries[tool_name].used = 0
 
-    def clear(self) -> None:
-        """Remove all entries (configuration + counters)."""
-        self._entries.clear()
-
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-
-    def summary(self) -> dict[str, Any]:
-        """Return a dict with all configured tools and their usage."""
-        return {
-            "default_max": self._default_max,
-            "tools": {name: e.to_dict() for name, e in self._entries.items()},
-        }
-
-    def __repr__(self) -> str:
-        n = len(self._entries)
-        return f"ToolBudget(tools={n}, default_max={self._default_max!r})"
+def make_tool_budget(**limits):
+    return ToolBudget(limits)

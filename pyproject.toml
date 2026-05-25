@@ -1,24 +1,23 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-tool-budget"
 version = "0.1.0"
-description = "Per-tool call count caps for agent runs"
+description = "Per-tool call-count budgets for agent loops — cap how many times each tool can be called. Zero dependencies."
 readme = "README.md"
-license = { file = "LICENSE" }
-requires-python = ">=3.9"
-dependencies = []
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["agents", "llm", "tools", "budget", "limits"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
 
-[project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.4"]
+[project.urls]
+Homepage = "https://github.com/MukundaKatta/agent-tool-budget"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/agent_tool_budget"]
-
-[tool.ruff]
-line-length = 88
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+[tool.setuptools.packages.find]
+where = ["src"]
