@@ -9,7 +9,6 @@ Zero dependencies — standard library only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 class BudgetExhausted(Exception):
@@ -17,7 +16,9 @@ class BudgetExhausted(Exception):
         self.tool_name = tool_name
         self.limit = limit
         self.used = used
-        super().__init__(f"budget exhausted for '{tool_name}': used {used}/{limit} calls")
+        super().__init__(
+            f"budget exhausted for '{tool_name}': used {used}/{limit} calls"
+        )
 
 
 @dataclass
@@ -84,7 +85,9 @@ class ToolBudget:
         current = self._used.get(tool_name, 0)
         new_count = current + n
         if limit is not None and new_count > limit:
-            self._used[tool_name] = new_count
+            # The call is denied, so it must not consume budget: leave the
+            # recorded usage untouched. The exception still reports the
+            # attempted count for diagnostics.
             if self.raise_on_exhausted:
                 raise BudgetExhausted(tool_name, limit, new_count)
             return False
@@ -116,13 +119,22 @@ class ToolBudget:
         return not self.exhausted(tool_name)
 
     def usage(self, tool_name):
-        return ToolUsage(tool_name=tool_name, limit=self._get_limit(tool_name), used=self._used.get(tool_name, 0))
+        return ToolUsage(
+            tool_name=tool_name,
+            limit=self._get_limit(tool_name),
+            used=self._used.get(tool_name, 0),
+        )
 
     def summary(self):
         result = {}
         for name in self._used:
             u = self.usage(name)
-            result[name] = {"used": u.used, "limit": u.limit, "remaining": u.remaining, "exhausted": u.exhausted}
+            result[name] = {
+                "used": u.used,
+                "limit": u.limit,
+                "remaining": u.remaining,
+                "exhausted": u.exhausted,
+            }
         return result
 
     def reset(self, tool_name=None):
